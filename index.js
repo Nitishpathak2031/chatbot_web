@@ -1,14 +1,18 @@
-import Dotenv from "dotenv";
+import dotenv from "dotenv";
 import axios from "axios";
 import * as cheerio from "cheerio";
 import { ChromaClient } from "chromadb";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-Dotenv.config();
+dotenv.config();
 
 // ✅ Initialize Gemini client
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+// ✅ FIX 1: Changed model to 'gemini-pro'
+// 'gemini-1.5-flash' was causing the 404 error.
+// 'gemini-pro' is the standard stable model for generateContent.
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 // ✅ Initialize Chroma client
 const chromaClient = new ChromaClient({
@@ -26,8 +30,15 @@ async function scrapeWebPage(url = "") {
   const { data } = await axios.get(url);
   const $ = cheerio.load(data);
 
+  // Using .text() is fast but can be noisy.
+  // For better results, you might target specific elements like 'article', 'main', or 'p'
   const pageHead = $("head").text();
-  const pageBody = $("body").text();
+  const pageBody = $("body")
+    .clone() // Clone to avoid modifying the original
+    .find("script, style, nav, footer, header") // Remove common noisy elements
+    .remove()
+    .end()
+    .text();
 
   const internalLinks = new Set();
   const externalLinks = new Set();
@@ -45,7 +56,7 @@ async function scrapeWebPage(url = "") {
 
   return {
     head: pageHead,
-    body: pageBody,
+    body: pageBody.replace(/\s+/g, " ").trim(), // Clean up whitespace
     internalLinks: Array.from(internalLinks),
     externalLinks: Array.from(externalLinks),
   };
@@ -54,9 +65,11 @@ async function scrapeWebPage(url = "") {
 // ------------------- EMBEDDING (using Gemini) -------------------
 async function generateVectorEmbeddings(text) {
   try {
-    const model = genAI.getGenerativeModel({ model: "text-embedding-004" });
+    const embeddingModel = genAI.getGenerativeModel({
+      model: "text-embedding-004",
+    });
 
-    const result = await model.embedContent({
+    const result = await embeddingModel.embedContent({
       content: {
         parts: [
           {
@@ -74,9 +87,10 @@ async function generateVectorEmbeddings(text) {
 }
 
 // ------------------- INSERT INTO DB -------------------
-async function insertIntoDB(embedding, url, body = "", head = "") {
+// ✅ FIX 2: Added 'id' as a parameter.
+async function insertIntoDB(id, embedding, url, body = "", head = "") {
   if (!embedding || embedding.length === 0) {
-    console.warn("⚠️ Skipped empty embedding for:", url);
+    console.warn("⚠️ Skipped empty embedding for:", id);
     return;
   }
 
@@ -86,7 +100,8 @@ async function insertIntoDB(embedding, url, body = "", head = "") {
   });
 
   await collection.add({
-    ids: [url],
+    // ✅ FIX 2: Use the unique 'id' here instead of just 'url'
+    ids: [id],
     embeddings: [embedding],
     metadatas: [{ url, head, body }],
   });
@@ -106,15 +121,28 @@ function chunkText(text, chunkSize) {
 // ------------------- INGEST -------------------
 async function ingest(url = "") {
   console.log(`🧠 Ingesting: ${url}`);
-  const { head, body } = await scrapeWebPage(url);
-  const bodyChunks = chunkText(body, 1000);
+  try {
+    const { head, body } = await scrapeWebPage(url);
+    const bodyChunks = chunkText(body, 1000); // 1000 words is a large chunk, consider 250-500
 
-  for (const chunk of bodyChunks) {
-    const bodyEmbedding = await generateVectorEmbeddings(chunk);
-    await insertIntoDB(bodyEmbedding, url, chunk, head);
+    console.log(`... found ${bodyChunks.length} chunks`);
+
+    // ✅ FIX 2: Loop with an index to create a unique ID for each chunk
+    for (let i = 0; i < bodyChunks.length; i++) {
+      const chunk = bodyChunks[i];
+      const chunkId = `${url}-chunk-${i}`; // This is the new unique ID
+
+      console.log(`... embedding chunk ${i + 1}/${bodyChunks.length}`);
+      const bodyEmbedding = await generateVectorEmbeddings(chunk);
+
+      // Pass the unique 'chunkId' to the database function
+      await insertIntoDB(chunkId, bodyEmbedding, url, chunk, head);
+    }
+
+    console.log(`✅ Ingested: ${url}`);
+  } catch (error) {
+    console.error(`❌ Failed to ingest ${url}:`, error.message);
   }
-
-  console.log(`✅ Ingested: ${url}`);
 }
 
 // ------------------- CHAT QUERY -------------------
@@ -132,47 +160,45 @@ async function chat(question = "") {
     queryEmbeddings: [questionEmbedding],
   });
 
-  const Bodyresponse = results.metadatas[0]
-  .map((e) => e.body)
-  .filter((e) => e.trim() !== '' && !!e);
+  const metadatas = results?.metadatas?.[0] || [];
+  if (metadatas.length === 0) {
+    console.log("🤖: I'm sorry, I couldn't find any relevant context in my database to answer that.");
+    return;
+  }
 
-  const urlresponse = results.metadatas[0]
-  .map((e) => e.url)
-  .filter((e) => e.trim() !== '' && !!e);
+  const Bodyresponse = metadatas.map((e) => e.body).filter(Boolean);
+  const urlresponse = [...new Set(metadatas.map((e) => e.url))]; // Get unique URLs
 
-  console.log("📄 Top results:", urlresponse);
-//   console.log("📄 Top results:", Bodyresponse);
+  console.log("📄 Top URLs:", urlresponse);
+  // console.log("📄 Top bodies:", Bodyresponse); // This can be very long, optional
 
-  const response = await model.generateContent([
-  {
-    role: "system",
-    parts: [
-      {
-        text:
-          "You are an AI agent expert in providing support to users on behalf of a webpage. Given the page content, reply accordingly.",
-      },
-    ],
-  },
-  {
-    role: "user",
-    parts: [
-      {
-        text: `Query: ${question}\n\nURL: ${urlresponse.join(
-          ", "
-        )}\n\nRetrieved Context: ${Bodyresponse.join(", ")}`,
-      },
-    ],
-  },
-]);
+  const prompt = `
+You are an AI agent expert in providing support to users on behalf of a webpage.
+Given the page content, reply accordingly. Answer the user's query based *only* on the retrieved context.
+If the context is not sufficient to answer, say so.
 
-console.log("🤖:", response.response.text());
+Query: ${question}
+URL(s): ${urlresponse.join(", ")}
+Retrieved Context:
+---
+${Bodyresponse.join("\n---\n")}
+---
+Answer:`;
+
+  const response = await model.generateContent(prompt);
+  console.log("🤖:", response.response.text());
 }
 
 // ------------------- RUN -------------------
-// Uncomment this once to scrape and store data
+// Make sure ChromaDB is running locally on localhost:8000
+
+// Uncomment this block to scrape and store data
+// console.log("--- Starting Ingestion ---");
 // await ingest("https://www.piyushgarg.dev");
 // await ingest("https://www.piyushgarg.dev/cohort");
 // await ingest("https://www.piyushgarg.dev/about");
+// console.log("--- Ingestion Complete ---");
 
 // Then run chat after ingestion
-await chat("What is cohort?");
+console.log("--- Starting Chat ---");
+await chat("What are the things in cohort code ninja");
